@@ -1,0 +1,9 @@
+{
+  "name": "uptimeguard",
+  "private": true,
+  "scripts": {
+    "build": "npm run build --prefix frontend",
+    "check-no-float": "node scripts/check-no-float-money.js",
+    "test:money": "npm run test:money --prefix frontend"
+  }
+}
