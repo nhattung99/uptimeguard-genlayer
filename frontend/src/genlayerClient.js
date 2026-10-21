@@ -59,15 +59,15 @@ export const formatWriteError = (err) => {
   const msg = String(err?.shortMessage || err?.details || err?.message || err || '');
   const low = msg.toLowerCase();
   if (low.includes('user rejected') || low.includes('user denied') || low.includes('rejected the request')) {
-    return 'Bạn đã huỷ giao dịch trong MetaMask.';
+    return 'You cancelled the transaction in MetaMask.';
   }
   if (low.includes('insufficient') || low.includes('funds')) {
-    return 'Không đủ GEN cho phí kỳ cộng gas. Nạp ví từ GenLayer Studio → Accounts.';
+    return 'Not enough GEN for the period fee plus gas. Fund the wallet from GenLayer Studio → Accounts.';
   }
   if (low.includes('invalid address') || (low.includes('undefined') && low.includes('address'))) {
-    return 'Chưa gắn được địa chỉ ví. Kết nối lại MetaMask trên GenLayer Studionet rồi thử lại.';
+    return 'The wallet address could not be attached. Reconnect MetaMask on GenLayer Studionet and try again.';
   }
-  return msg || 'Giao dịch ghi thất bại.';
+  return msg || 'The write transaction failed.';
 };
 
 const toValueBigInt = (value) => {
@@ -193,29 +193,29 @@ const waitForStudioEvmReceipt = async (txHash, maxRetries = 24, intervalMs = 200
     if (receipt) {
       const status = receipt.status;
       if (status === '0x0' || status === 0 || status === '0') {
-        throw new Error('Giao dịch Studionet bị revert. Trạng thái contract không đổi.');
+        throw new Error('The Studionet transaction reverted. Contract state is unchanged.');
       }
       await new Promise((r) => setTimeout(r, 1500));
       return receipt;
     }
     await new Promise((r) => setTimeout(r, intervalMs));
   }
-  throw new Error(`Hết thời gian chờ biên nhận Studionet ${txHash}.`);
+  throw new Error(`Timed out waiting for the Studionet receipt ${txHash}.`);
 };
 
 export const sendContractTransaction = async ({ from, to = CONTRACT_ADDRESS, functionName, args = [], value = '0x0' }) => {
   if (!isContractConfigured(to)) {
-    throw new Error('Chưa có địa chỉ contract. Deploy trên GenLayer Studio, rồi đặt VITE_CONTRACT_ADDRESS.');
+    throw new Error('No contract address yet. Deploy on GenLayer Studio, then set VITE_CONTRACT_ADDRESS.');
   }
   if (typeof window === 'undefined' || !window.ethereum) {
-    throw new Error('Cần MetaMask để ký giao dịch GenLayer.');
+    throw new Error('MetaMask is required to sign a GenLayer transaction.');
   }
   const accs = await window.ethereum.request({ method: 'eth_requestAccounts' });
   const sender = toAddress(from) || (accs && accs[0]);
-  if (!sender) throw new Error('Chưa kết nối ví. Hãy kết nối MetaMask trước.');
+  if (!sender) throw new Error('No wallet is connected. Connect MetaMask first.');
   await switchToGenlayerStudionet();
   const client = getGenlayerClient(sender);
-  if (!client || !client.writeContract) throw new Error('Client ghi GenLayer không sẵn sàng.');
+  if (!client || !client.writeContract) throw new Error('The GenLayer write client is not ready.');
   try {
     return await client.writeContract({
       account: toWriteAccount(sender),
@@ -230,7 +230,7 @@ export const sendContractTransaction = async ({ from, to = CONTRACT_ADDRESS, fun
 };
 
 export const waitForFinalizedTx = async (txHash, maxRetries = 24, intervalMs = 2000) => {
-  if (!txHash) throw new Error('Thiếu mã giao dịch.');
+  if (!txHash) throw new Error('Missing transaction hash.');
   let evmReceipt = null;
   try {
     evmReceipt = await waitForStudioEvmReceipt(txHash, maxRetries, intervalMs);
@@ -251,16 +251,16 @@ export const waitForFinalizedTx = async (txHash, maxRetries = 24, intervalMs = 2
       const execStr = String(execName || '').toUpperCase();
       if (execName === ExecutionResult.FINISHED_WITH_ERROR || execStr.includes('FINISHED_WITH_ERROR')) {
         const detail = receipt?.txExecutionError || receipt?.stderr || '';
-        throw new Error('Contract chạy lỗi (không ACCEPTED). Trạng thái không đổi. ' + String(detail));
+        throw new Error('The contract finished with an error (not ACCEPTED). State is unchanged. ' + String(detail));
       }
       return receipt;
     } catch (err) {
       const msg = String(err?.message || '');
-      if (msg.includes('không ACCEPTED') || msg.includes('not ACCEPTED') || msg.includes('chạy lỗi')) throw err;
+      if (msg.includes('not ACCEPTED') || msg.includes('finished with an error')) throw err;
     }
   }
   if (evmReceipt) return evmReceipt;
-  throw new Error('Hết thời gian chờ trạng thái ACCEPTED trên GenLayer.');
+  throw new Error('Timed out waiting for ACCEPTED on GenLayer.');
 };
 
 export const readContractState = async (functionName, args = [], targetAddress = CONTRACT_ADDRESS) => {

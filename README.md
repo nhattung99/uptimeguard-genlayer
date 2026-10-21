@@ -1,77 +1,81 @@
 # UptimeGuard
 
-Escrow phí kỳ hosting / API trên **một** Intelligent Contract GenLayer. Customer khoá phí bằng GEN. Provider phải chấp nhận điều khoản. Hết kỳ, customer có thể nộp khiếu nại kèm bằng chứng và ít nhất hai nguồn tham chiếu. Đồng thuận AI (`gl.vm.run_nondet`) trả về đúng một trong hai kết quả: `SLA_MET` hoặc `SLA_BREACHED`. Mức bồi hoàn là số cố định hai bên đã chốt, validator so **tuyệt đối** (`==`), không có dung sai phần trăm trên số tiền.
+UptimeGuard escrows one hosting or API period fee in a single GenLayer Intelligent Contract. The customer locks the fee in GEN. The provider must accept the terms. After the period, the customer can file a claim with evidence and at least two reference sources. AI consensus (`gl.vm.run_nondet`) returns exactly one of two results: `SLA_MET` or `SLA_BREACHED`. The refund is a fixed amount both parties agreed in advance. Validators compare it with absolute equality (`==`). There is no percentage tolerance on the money.
 
-> UptimeGuard chết nếu không có GenLayer: không có smart contract EVM nào đọc hiểu được lịch sử sự cố phi cấu trúc trên các trang status và monitor để đối chiếu với điều khoản SLA bằng ngôn ngữ tự nhiên, và không có bên trọng tài nào đủ rẻ cho từng hợp đồng hosting/API nhỏ — chỉ có đồng thuận AI phi tập trung của GenLayer mới làm được với chi phí gần bằng 0.
+> UptimeGuard dies without GenLayer: no EVM smart contract can read unstructured incident history on status pages and monitors, compare it with a natural-language SLA, and stay cheap enough for a small hosting or API contract. Only GenLayer's decentralized AI consensus can do that at near-zero cost.
 
-**Mạng:** Studionet. Không chuyển sang testnet hay chain khác.
+**Network:** Studionet only.
 
-Miễn phí sử dụng — chỉ tốn phí gas mạng GenLayer khi ký giao dịch. Không có phí nền tảng nào khác.
+Free to use — you only pay GenLayer network gas when you sign a transaction. There is no other platform fee.
 
-## Contract đã deploy
+## Live App
 
-Chưa có. Sau khi deploy tay trên Studio và thấy `Result: SUCCESS`, điền:
+The production URL is recorded here after the Vercel deploy is verified.
 
-- **Địa chỉ:** _(chưa có)_
-- **Explorer:** `https://explorer-studio.genlayer.com/address/<address>`
+## Deployed Contract
+
+Deployed on GenLayer Studionet with `Result: SUCCESS`.
+
+- **Address:** `0xB71F31BC1Ca3a772E7c89604871D5818bC8EbA3D`
+- **Explorer:** https://genlayer-explorer.vercel.app/address/0xB71F31BC1Ca3a772E7c89604871D5818bC8EbA3D
 
 ```env
-VITE_CONTRACT_ADDRESS=
+VITE_CONTRACT_ADDRESS=0xB71F31BC1Ca3a772E7c89604871D5818bC8EbA3D
 ```
 
-Khi biến này trống, frontend vẫn chạy: banner vàng báo chưa có địa chỉ, form xem trước số tiền vẫn dùng được, nút ký bị khoá, trang không trắng.
+If that variable is empty, the frontend still opens: a warning banner says the address is missing, the fee preview still works, signing stays locked, and the page does not go blank.
 
-## Bài toán
+## Problem
 
-Khách trả phí tháng cho nhà cung cấp hosting hoặc API nhỏ, kèm cam kết uptime. Khi có sự cố, nhà cung cấp thường tự đo và tự quyết bồi hoàn. Hai bên thiếu một trọng tài rẻ, nhanh, khách quan cho từng hợp đồng nhỏ.
+A customer pays a monthly fee to a small hosting or API provider, with an uptime promise attached. When something breaks, the provider usually measures the outage and decides the refund itself. The two sides have no cheap, fast, neutral referee for a small contract.
 
-UptimeGuard giữ phí kỳ trong contract:
+UptimeGuard holds the period fee in the contract:
 
-1. Customer tạo thoả thuận: địa chỉ provider, mô tả dịch vụ, điều khoản SLA, mức bồi hoàn cố định (`0 < breach_refund_amount < fee_amount`), ngày kết thúc kỳ, thời hạn khiếu nại. GEN gửi kèm giao dịch là `fee_amount`.
-2. Provider gọi `accept_agreement` trước khi kỳ kết thúc. Nếu không, customer gọi `cancel_unaccepted` và nhận lại toàn bộ phí.
-3. Trong `[period_end, claim_deadline]`, customer nộp ít nhất 1 link bằng chứng và 2 link tham chiếu.
-4. Ai cũng có thể gọi `resolve_claim`. AI đối chiếu điều khoản với các trang đã đọc.
-5. `confidence < 60` → `DISPUTED`. Customer nộp lại được cho tới `stale_deadline`.
-6. Hết hạn khiếu nại mà vẫn `ACTIVE` → ai cũng gọi `settle_unclaimed`, provider nhận đủ phí.
-7. Hết hạn tranh chấp mà vẫn `DISPUTED` → ai cũng gọi `settle_stale_dispute`, provider nhận đủ phí.
+1. The customer creates an agreement: provider address, service description, SLA terms, a fixed refund (`0 < breach_refund_amount < fee_amount`), period end, and a claim window. The GEN attached to the transaction is `fee_amount`.
+2. The provider calls `accept_agreement` before the period ends. Otherwise the customer calls `cancel_unaccepted` and receives the full fee back.
+3. Inside `[period_end, claim_deadline]`, the customer submits at least 1 evidence link and 2 reference links.
+4. Anyone can call `resolve_claim`. The AI compares the terms with the pages it read.
+5. `confidence < 60` sets `DISPUTED`. The customer can refile until `stale_deadline`.
+6. If the claim window closes while the agreement is still `ACTIVE`, anyone can call `settle_unclaimed` and the provider receives the full fee.
+7. If the dispute window closes while the agreement is still `DISPUTED`, anyone can call `settle_stale_dispute` and the provider receives the full fee.
 
-Gánh nặng chứng minh thuộc về customer. Bằng chứng không đủ, mâu thuẫn, hoặc không có timestamp để xác định thời gian ngừng thì kết quả là `SLA_MET`. Đây là lựa chọn thiết kế nghiêng về provider.
+The burden of proof is on the customer. Insufficient, contradictory, or untimestamped evidence resolves as `SLA_MET`. That design leans toward the provider.
 
-## Kiến trúc
+## Architecture
 
-Một contract, [`contracts/uptime_guard.py`](contracts/uptime_guard.py), giữ GEN trực tiếp. Không có contract thứ hai, không chuyển value qua cross-contract call.
+One contract, [`contracts/uptime_guard.py`](contracts/uptime_guard.py), holds the GEN directly. There is no second contract and no value forwarded through a cross-contract call.
 
-Header Studio:
+Studio header:
 
 ```python
 # v0.2.16
 # { "Depends": "py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6" }
 ```
 
-| Việc | API dùng |
+| Job | API |
 |---|---|
-| Người gọi | `gl.message.sender_address` |
-| Chuyển GEN | `gl.get_contract_at(address).emit_transfer(value=u256(amount))` |
-| Nhận GEN lúc tạo thoả thuận | `@gl.public.write.payable` rồi đọc `gl.message.value` |
-| Thời gian | `gl.message_raw["datetime"]` (ISO-8601), dự phòng `gl.message.datetime`, rồi `datetime.now` đã được GenVM ghim vào timestamp giao dịch |
-| Map | `TreeMap.get(key, default)` khi cần default |
+| Caller | `gl.message.sender_address` |
+| Send GEN | `gl.get_contract_at(address).emit_transfer(value=u256(amount))` |
+| Receive GEN when the agreement is created | `@gl.public.write.payable`, then read `gl.message.value` |
+| Time | `gl.message_raw["datetime"]` (ISO-8601), then `gl.message.datetime`, then `datetime.now`, which GenVM pins to the transaction timestamp |
+| Map | `TreeMap.get(key, default)` when a default is needed |
 
-`@gl.public.write.payable` có trong `genlayer/gl/annotations.py` của đúng hash trên. Runner từ chối value khác 0 trên method không payable (`called non-payable method ... with non-zero value`). Vì vậy `create_agreement` bắt buộc dùng `.payable`. Ghi chú cũ "decorator payable không tồn tại" không còn đúng với SDK này.
+`@gl.public.write.payable` exists in `genlayer/gl/annotations.py` for this hash. The runner rejects a non-zero value on a non-payable method (`called non-payable method ... with non-zero value`). `create_agreement` therefore uses `.payable`. The older note that the payable decorator does not exist is wrong for this SDK.
 
-`gl.vm.Return` của SDK này giữ kết quả ở `.calldata`, không có `.value`. Validator so `verdict` bằng `==`, và cùng một phía của ngưỡng `confidence >= 60`, để hai validator không cùng nói `SLA_MET` rồi một bên giải ngân còn bên kia để `DISPUTED`.
+`gl.vm.Return` in this SDK stores the leader result on `.calldata`. There is no `.value`. The validator compares `verdict` with `==` and requires both sides to land on the same side of `confidence >= 60`, so two validators cannot both say `SLA_MET` while one settles and the other leaves the claim `DISPUTED`.
 
-`DynArray()` không khởi tạo được (`this class can't be instantiated by user`). Mảng URL rỗng ghi bằng `[]`; storage tự đưa về `DynArray`.
+`DynArray()` cannot be constructed (`this class can't be instantiated by user`). Empty URL lists are stored as `[]`; storage coerces them to `DynArray`.
 
-## Luồng resolve
+## Resolve flow
 
 ```
 PENDING_ACCEPTANCE
-  ├─ accept_agreement (trước period_end) → ACTIVE
+  ├─ accept_agreement (before period_end) → ACTIVE
   └─ cancel_unaccepted → CUSTOMER_FULL → CANCELLED_REFUNDED
 
 ACTIVE
-  ├─ file_claim trong [period_end, claim_deadline] → CLAIM_FILED
-  └─ sau claim_deadline: settle_unclaimed → PROVIDER_FULL → SETTLED_NO_CLAIM
+  ├─ file_claim inside [period_end, claim_deadline] → CLAIM_FILED
+  └─ after claim_deadline: settle_unclaimed → PROVIDER_FULL → SETTLED_NO_CLAIM
 
 CLAIM_FILED
   └─ resolve_claim
@@ -80,80 +84,80 @@ CLAIM_FILED
        └─ SLA_BREACHED → SPLIT_BREACH → RESOLVED_SLA_BREACHED
 
 DISPUTED
-  ├─ file_claim lại trước stale_deadline → CLAIM_FILED
-  └─ sau stale_deadline: settle_stale_dispute → PROVIDER_FULL → SETTLED_STALE_DISPUTE
+  ├─ file_claim again before stale_deadline → CLAIM_FILED
+  └─ after stale_deadline: settle_stale_dispute → PROVIDER_FULL → SETTLED_STALE_DISPUTE
 
-PAYOUT_FAILED → retry_resolution (không chạy lại AI, chỉ trả phần còn thiếu)
+PAYOUT_FAILED → retry_resolution (does not re-run the AI; pays only the missing side)
 ```
 
-Mốc thời gian:
+Deadlines:
 
 - `claim_deadline = period_end + claim_window_seconds`
 - `stale_deadline = claim_deadline + claim_window_seconds`
-- Cửa sổ khiếu nại là đoạn đóng `[period_end, claim_deadline]`
-- `settle_unclaimed` chỉ khi `now > claim_deadline`
-- `settle_stale_dispute` chỉ khi `now > stale_deadline`
+- The claim window is the closed interval `[period_end, claim_deadline]`
+- `settle_unclaimed` only when `now > claim_deadline`
+- `settle_stale_dispute` only when `now > stale_deadline`
 
-Mọi lần chuyển tiền đi qua `_settle(kind, success_status)`. Loại giải ngân được ghi **trước** khi chuyển: `PROVIDER_FULL`, `SPLIT_BREACH`, hoặc `CUSTOMER_FULL`. Hai cờ `provider_paid` và `customer_refunded` khiến `retry_resolution` không trả trùng.
+Every transfer goes through `_settle(kind, success_status)`. The payout kind is stored **before** the transfer: `PROVIDER_FULL`, `SPLIT_BREACH`, or `CUSTOMER_FULL`. The flags `provider_paid` and `customer_refunded` keep `retry_resolution` from paying the same side twice.
 
-`SLA_BREACHED`: provider nhận `fee - breach_refund_amount`, customer nhận đúng `breach_refund_amount`.
+On `SLA_BREACHED`, the provider receives `fee - breach_refund_amount` and the customer receives exactly `breach_refund_amount`.
 
-## Giới hạn trung thực
+## Honest limits
 
-1. Chỉ xác minh được những sự cố **được ghi nhận công khai**. Nếu provider không công bố sự cố và không có monitor hoặc archive nào ghi lại thì không có gì để đối chiếu.
-2. Trang status của provider **do provider kiểm soát**, có thể bỏ sót hoặc xoá sự cố. Nguồn độc lập thật sự là monitor bên thứ ba và bản lưu trữ archive có timestamp; UI phải nhắc customer ưu tiên các nguồn này.
-3. LLM ước lượng tổng thời gian ngừng từ log sự cố có thể sai. Vì vậy điều khoản SLA nên đơn giản và khách quan (ngưỡng phút ngừng cụ thể), tránh công thức phức tạp.
-4. Nguyên tắc "thiếu bằng chứng → `SLA_MET`" nghiêng về provider (mục thiết kế về gánh nặng chứng minh).
-5. Nhiều trang status render bằng JavaScript hoặc chặn truy cập tự động, `web.render` có thể không đọc được. Một số trang dùng dịch vụ status phổ biến có endpoint dữ liệu công khai; **kiểm tra thực tế khi dev, không giả định**. Trang không đọc được → giao dịch revert, thử lại được.
-6. Contract chỉ giữ tiền và phân xử; **việc cung cấp dịch vụ diễn ra ngoài chuỗi** và contract không kiểm soát được.
-7. Chống prompt injection chỉ giảm rủi ro.
-8. Mỗi thoả thuận chỉ đại diện **1 kỳ**; kỳ tiếp theo tạo thoả thuận mới.
+1. Only incidents **recorded in public** can be checked. If the provider never publishes an incident and no monitor or archive recorded it, there is nothing to compare.
+2. The provider **controls its own status page** and can omit or delete incidents. A real independent source is a third-party monitor or a timestamped archive. The UI tells the customer to prefer those sources.
+3. An LLM can misread total downtime from incident logs. SLA terms should stay simple and objective (a concrete downtime threshold), not a complex formula.
+4. The rule "insufficient evidence → `SLA_MET`" leans toward the provider (the burden-of-proof design).
+5. Many status pages render with JavaScript or block automated access, so `web.render` may not be able to read them. Some popular status services expose a public data endpoint; **check that in practice, do not assume it**. An unreadable page reverts the transaction, and the call can be retried.
+6. The contract only holds the fee and adjudicates. **The service itself happens off-chain** and the contract cannot control it.
+7. The prompt-injection defense only reduces risk.
+8. Each agreement covers **one period**. The next period needs a new agreement.
 
-### Trang status đã thử bằng HTTP GET (21 Oct 2026)
+### Status pages checked with HTTP GET (21 Oct 2026)
 
-Đây là GET thường, chưa phải `gl.nondet.web.render` trên Studionet. `web.render` chỉ kiểm được khi có giao dịch resolve thật sau khi contract được deploy.
+These are ordinary GETs, not `gl.nondet.web.render` on Studionet. `web.render` can only be checked with a real resolve transaction after the contract is deployed.
 
-| URL | HTTP | Ghi chú |
+| URL | HTTP | Note |
 |---|---|---|
-| `https://www.githubstatus.com/api/v2/summary.json` | 200 `application/json` | Summary Statuspage, có `updated_at`. Nên dùng làm reference URL. |
-| `https://www.cloudflarestatus.com/api/v2/summary.json` | 200 `application/json` | Cùng kiểu summary JSON. |
-| `https://www.githubstatus.com/` | 200 `text/html` | Vỏ HTML. Nội dung sự cố có thể chỉ xuất hiện sau JavaScript — `web.render` có thể đọc được hoặc không. |
-| `https://status.aws.amazon.com/` | 200 `text/html` | HTML tĩnh hơn, vẫn chưa xác nhận bằng `web.render`. |
+| `https://www.githubstatus.com/api/v2/summary.json` | 200 `application/json` | Statuspage summary, includes `updated_at`. A good reference URL. |
+| `https://www.cloudflarestatus.com/api/v2/summary.json` | 200 `application/json` | Same kind of JSON summary. |
+| `https://www.githubstatus.com/` | 200 `text/html` | HTML shell. Incident text may appear only after JavaScript, so `web.render` may or may not read it. |
+| `https://status.aws.amazon.com/` | 200 `text/html` | More static HTML. Still not confirmed with `web.render`. |
 
-Ưu tiên URL JSON hoặc archive có timestamp. Nếu `web.render` không đọc được một URL, `resolve_claim` revert và gọi lại được.
+Prefer a JSON URL or a timestamped archive. If `web.render` cannot read a URL, `resolve_claim` reverts and can be called again.
 
-## Bảng đối chiếu xử lý tiền
+## Money handling
 
-Mọi số tiền là số nguyên wei (`1 GEN = 10^18`). Không có `float`, `parseFloat`, `Math.round`, `Math.floor`, `Math.ceil` trên đường đi của tiền.
+Every amount is an integer number of wei (`1 GEN = 10^18`). There is no `float`, `parseFloat`, `Math.round`, `Math.floor`, or `Math.ceil` on the money path.
 
-| # | Chỗ xử lý | File | Ghi hay đọc | Cách xử lý | Đơn vị |
+| # | Place | File | Write or read | How | Unit |
 |---|---|---|---|---|---|
-| 1 | Phí kỳ gửi kèm lúc tạo | `create_agreement` ← `gl.message.value` | WRITE `fee_amount` | `bigint(gl.message.value)` | wei |
-| 2 | Mức bồi hoàn cố định | `create_agreement` tham số | WRITE `breach_refund_amount` | `bigint`, ràng buộc `0 < x < fee` | wei |
-| 3 | Provider nhận đủ phí | `_execute_settlement` `PROVIDER_FULL` | READ `fee_amount` | `emit_transfer(value=u256(fee))` | wei |
-| 4 | Chia khi SLA vi phạm | `_execute_settlement` `SPLIT_BREACH` | READ cả hai | provider `fee - refund`, customer `refund` | wei |
-| 5 | Customer nhận lại toàn bộ | `_execute_settlement` `CUSTOMER_FULL` | READ `fee_amount` | `emit_transfer` cho customer | wei |
-| 6 | Thử lại phần còn thiếu | `retry_resolution` | READ cờ `provider_paid` / `customer_refunded` và `settlement_kind` đã lưu | không tính lại, không chạy lại AI | wei |
-| 7 | Ô nhập GEN | `frontend/src/money.js` `sanitizeGenInput` | WRITE chuỗi nhập | chỉ chữ số và một dấu `.`, tối đa 18 số lẻ | chuỗi GEN |
-| 8 | GEN → wei trước khi ký | `parseGenToWei` | WRITE `value` của giao dịch và `breach_refund_amount` | ghép phần nguyên + 18 chữ số lẻ thành `BigInt` | wei |
-| 9 | Chip 25% / 50% / 75% | `percentOfWei` | WRITE gợi ý bồi hoàn | `fee * pct / 100n`, chia nguyên | wei |
-| 10 | Preview trước khi ký | `computeBreachPreview` | READ | customer = refund, provider = `fee - refund` | wei |
-| 11 | Hiển thị số dư / payout | `formatWeiToGen` | READ | `wei / 10^18` và `%` bằng `BigInt` | chuỗi GEN |
-| 12 | Ba kiểu giải ngân trên UI | `settlementShares` | READ `settlement_kind`, fee, refund | cùng công thức với contract | wei |
-| 13 | `value` gửi MetaMask | `toValueBigInt` | WRITE | `bigint` hoặc chuỗi hex → `BigInt`; `number` JS thành `0n` | wei |
-| 14 | Field đọc từ contract | `toWeiString` | READ | chỉ chuỗi chữ số; `typeof number` → `"0"` để không nuốt wei lớn | chuỗi wei |
-| 15 | Chặn float lúc build | `scripts/check-no-float-money.js`, gắn `prebuild` | — | fail nếu `parseFloat` / `Math.round` / `floor` / `ceil` đứng gần `fee\|refund\|amount\|payout\|balance\|wei\|gen` | — |
+| 1 | Period fee attached at creation | `create_agreement` ← `gl.message.value` | WRITE `fee_amount` | `bigint(gl.message.value)` | wei |
+| 2 | Fixed refund | `create_agreement` argument | WRITE `breach_refund_amount` | `bigint`, constrained to `0 < x < fee` | wei |
+| 3 | Provider receives the full fee | `_execute_settlement` `PROVIDER_FULL` | READ `fee_amount` | `emit_transfer(value=u256(fee))` | wei |
+| 4 | Split when the SLA is breached | `_execute_settlement` `SPLIT_BREACH` | READ both | provider `fee - refund`, customer `refund` | wei |
+| 5 | Customer receives the full fee | `_execute_settlement` `CUSTOMER_FULL` | READ `fee_amount` | `emit_transfer` to the customer | wei |
+| 6 | Retry the missing side | `retry_resolution` | READ `provider_paid` / `customer_refunded` and the stored `settlement_kind` | does not recompute and does not re-run the AI | wei |
+| 7 | GEN input | `frontend/src/money.js` `sanitizeGenInput` | WRITE the input string | digits and one `.`, at most 18 fractional digits | GEN string |
+| 8 | GEN → wei before signing | `parseGenToWei` | WRITE the transaction `value` and `breach_refund_amount` | integer part plus 18 fractional digits as `BigInt` | wei |
+| 9 | 25% / 50% / 75% chips | `percentOfWei` | WRITE the suggested refund | `fee * pct / 100n`, integer division | wei |
+| 10 | Preview before signing | `computeBreachPreview` | READ | customer = refund, provider = `fee - refund` | wei |
+| 11 | Display a balance or payout | `formatWeiToGen` | READ | `wei / 10^18` with `BigInt` | GEN string |
+| 12 | Three payout kinds in the UI | `settlementShares` | READ `settlement_kind`, fee, refund | same formula as the contract | wei |
+| 13 | `value` sent to MetaMask | `toValueBigInt` | WRITE | `bigint` or hex string → `BigInt`; a JS `number` becomes `0n` | wei |
+| 14 | Field read from the contract | `toWeiString` | READ | digit strings only; `typeof number` → `"0"` so a large wei value is not swallowed | wei string |
+| 15 | Float gate at build | `scripts/check-no-float-money.js`, wired to `prebuild` | — | fails if `parseFloat` / `Math.round` / `floor` / `ceil` sits near `fee\|refund\|amount\|payout\|balance\|wei\|gen` | — |
 
-## Test
+## Tests
 
 ```bash
 pip install -r requirements.txt
 pytest tests/test_uptime_guard.py -q
 ```
 
-Trước mỗi giao dịch nondet, test gọi `sim_installMocks` (và `mock_web` / `mock_llm`). Thời gian được đẩy bằng cách thay `_current_unix_timestamp`.
+Before every nondet transaction, the tests call `sim_installMocks` (and `mock_web` / `mock_llm`). Time moves by replacing `_current_unix_timestamp`.
 
-`emit_transfer` được spy theo địa chỉ nhận: có thể ép riêng provider, riêng customer, hoặc cả hai ném exception.
+`emit_transfer` is spied by recipient. The spy can force the provider, the customer, or both to throw.
 
 Frontend:
 
@@ -164,16 +168,16 @@ npm run test:money
 npm run build
 ```
 
-`npm run build` chạy `prebuild` → `scripts/check-no-float-money.js`.
+`npm run build` runs `prebuild` → `frontend/scripts/check-no-float-money.cjs`. The repo-root copy at `scripts/check-no-float-money.js` scans the same sources. The frontend copy uses `.cjs` because `frontend/package.json` is `"type": "module"`.
 
-## Deploy contract trên Studionet
+## Deploy the contract on Studionet
 
-1. Mở [GenLayer Studio → Run & Debug](https://studio.genlayer.com/run-debug).
-2. Dán `contracts/uptime_guard.py`, giữ nguyên hai dòng header.
-3. Deploy. Mở giao dịch và xác nhận **`Result: SUCCESS`**.
-4. Đặt `VITE_CONTRACT_ADDRESS` trong `frontend/.env` và trên Vercel.
+1. Open [GenLayer Studio → Run & Debug](https://studio.genlayer.com/run-debug).
+2. Paste `contracts/uptime_guard.py` and keep the two header lines.
+3. Deploy. Open the transaction and confirm **`Result: SUCCESS`**.
+4. Set `VITE_CONTRACT_ADDRESS` in `frontend/.env` and on Vercel.
 
-Không tự deploy từ agent. Không đổi mạng.
+The deployed address is in **Deployed Contract** above. Do not switch the network.
 
 ## Frontend
 
@@ -183,8 +187,8 @@ npm install
 npm run dev
 ```
 
-Mở `http://localhost:3000`. Chain là `studionet` từ `genlayer-js/chains`. Ví cần GEN từ Studio → Accounts.
+Open `http://localhost:3000`. The chain is `studionet` from `genlayer-js/chains`. The wallet needs GEN from Studio → Accounts.
 
-Điều khoản SLA chọn từ mẫu (câu tiếng Anh cố định). Có ô "điều khoản khác". Kỳ 7/30/90 ngày và hạn khiếu nại 3/7/14 ngày tự tính `period_end` và `claim_window_seconds`. Chip phí và chip bồi hoàn 25/50/75% tính bằng `BigInt`. Preview nói rõ mỗi bên nhận bao nhiêu nếu SLA vi phạm và nếu không.
+SLA terms come from presets that generate a fixed English sentence. An "Other terms" field is available. Periods of 7, 30, or 90 days and claim windows of 3, 7, or 14 days compute `period_end` and `claim_window_seconds`. Fee chips and 25/50/75% refund chips use `BigInt`. The preview states what each side receives if the SLA is breached and if it is not.
 
-Ở bước nộp khiếu nại, UI nhắc dùng monitor độc lập hoặc archive có timestamp. Thiếu bằng chứng đủ rõ được tính là SLA được đáp ứng.
+On the claim step, the UI asks for an independent monitor or a timestamped archive. Evidence that is not clear enough is treated as the SLA being met.

@@ -3,7 +3,10 @@ const path = require('path');
 
 const WINDOW = 12;
 const BLOCK_MAX = 40;
-const SRC = path.join(__dirname, '..', 'frontend', 'src');
+const SRC = [
+  path.join(__dirname, '..', 'frontend', 'src'),
+  path.join(__dirname, '..', 'src')
+].find((dir) => fs.existsSync(dir));
 
 function getFilesRecursively(dir) {
   let results = [];
