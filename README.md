@@ -10,7 +10,7 @@ Free to use — you only pay GenLayer network gas when you sign a transaction. T
 
 ## Live App
 
-The production URL is recorded here after the Vercel deploy is verified.
+https://uptimeguard-genlayer.vercel.app
 
 ## Deployed Contract
 
