@@ -109,10 +109,14 @@ def _parse_verdict(raw, allowed) -> dict:
         confidence = int(data.get("confidence", 0))
     except Exception:
         confidence = 0
+    facts = " ".join(str(data.get("decisive_facts", "")).split())
+    if not facts:
+        raise UserError("LLM verdict missing decisive_facts")
     return {
         "verdict": verdict,
         "confidence": max(0, min(100, confidence)),
         "reason": str(data.get("reason", ""))[:500],
+        "decisive_facts": facts[:200],
     }
 
 
@@ -200,16 +204,29 @@ class Agreement:
     provider_paid: bool
     customer_refunded: bool
     settled: bool
+    decisive_facts: str
+    provider_credit: bigint
+    customer_credit: bigint
+    provider_in_flight: bool
+    customer_in_flight: bool
 
 
 class Contract(gl.Contract):
     owner: Address
     agreement_counter: bigint
     agreements: TreeMap[str, Agreement]
+    inflight_agreement_id: str
+    inflight_side: str
+    inflight_amount: bigint
+    inflight_balance_before: bigint
 
     def __init__(self):
         self.owner = _to_address(gl.message.sender_address)
         self.agreement_counter = bigint(0)
+        self.inflight_agreement_id = ""
+        self.inflight_side = ""
+        self.inflight_amount = bigint(0)
+        self.inflight_balance_before = bigint(0)
 
     def _deadlines(self, agreement: Agreement):
         claim_deadline = agreement.period_end + agreement.claim_window_seconds
@@ -270,6 +287,11 @@ class Contract(gl.Contract):
             provider_paid=False,
             customer_refunded=False,
             settled=False,
+            decisive_facts="",
+            provider_credit=bigint(0),
+            customer_credit=bigint(0),
+            provider_in_flight=False,
+            customer_in_flight=False,
         )
         return agreement_id
 
@@ -339,6 +361,9 @@ class Contract(gl.Contract):
         a = self.agreements[agreement_id]
         if a.status != "CLAIM_FILED":
             raise UserError("Claim not ready for resolution (status: " + a.status + ")")
+        _claim_deadline, stale_deadline = self._deadlines(a)
+        if _current_unix_timestamp() > stale_deadline:
+            raise UserError("The unresolved claim timed out; call settle_inconclusive")
 
         service_description = a.service_description
         sla_terms = a.sla_terms
@@ -378,7 +403,9 @@ class Contract(gl.Contract):
                 '- "SLA_MET": the SLA terms were met, OR the evidence is insufficient, contradictory, or lacks the\n'
                 "  timestamps needed to establish a breach.\n\n"
                 "Return ONLY raw JSON, no markdown:\n"
-                '{"verdict": "SLA_MET" | "SLA_BREACHED", "confidence": <0-100>, "reason": "<short justification citing the incidents and durations used>"}'
+                '{"verdict": "SLA_MET" | "SLA_BREACHED", "confidence": <0-100>, '
+                '"decisive_facts": "<canonical incidents and durations, or the single word insufficient>", '
+                '"reason": "<short justification citing the incidents and durations used>"}'
             )
 
             raw = gl.nondet.exec_prompt(prompt)
@@ -396,14 +423,17 @@ class Contract(gl.Contract):
                 return False
             if my_res["verdict"] != leader_val["verdict"]:
                 return False
+            leader_facts = str(leader_val.get("decisive_facts", "")).strip()
+            my_facts = str(my_res.get("decisive_facts", "")).strip()
+            if not leader_facts or leader_facts != my_facts:
+                return False
             try:
                 leader_conf = int(leader_val.get("confidence", 0))
                 my_conf = int(my_res.get("confidence", 0))
             except Exception:
                 return False
-            # Absolute equality on the binary verdict, plus the same side of the
-            # confidence gate. Otherwise two validators can both say SLA_MET and
-            # still diverge between RESOLVED and DISPUTED.
+            # Absolute equality on the verdict and on the decisive source facts,
+            # plus the same side of the confidence gate.
             return (leader_conf >= CONFIDENCE_THRESHOLD) == (my_conf >= CONFIDENCE_THRESHOLD)
 
         result = _consensus_dict(gl.vm.run_nondet(leader_fn, validator_fn))
@@ -411,6 +441,7 @@ class Contract(gl.Contract):
         a.verdict = result["verdict"]
         a.confidence = u256(result["confidence"])
         a.verdict_reason = result["reason"]
+        a.decisive_facts = result["decisive_facts"]
 
         if result["confidence"] < CONFIDENCE_THRESHOLD:
             a.status = "DISPUTED"
@@ -449,6 +480,113 @@ class Contract(gl.Contract):
             raise UserError("The dispute window has not closed yet")
         self._settle(agreement_id, "PROVIDER_FULL", "SETTLED_STALE_DISPUTE")
 
+    @gl.public.write
+    def replace_claim_evidence(
+        self,
+        agreement_id: str,
+        claim_evidence_urls: DynArray[str],
+        reference_urls: DynArray[str],
+    ) -> None:
+        """Customer replaces URLs while a filed claim is still inside the stale deadline."""
+        if agreement_id not in self.agreements:
+            raise UserError("Agreement does not exist")
+        a = self.agreements[agreement_id]
+        if not _same_address(gl.message.sender_address, a.customer):
+            raise UserError("Only the customer can replace claim evidence")
+        if a.status != "CLAIM_FILED":
+            raise UserError("Can only replace evidence in status: " + a.status)
+        _claim_deadline, stale_deadline = self._deadlines(a)
+        if _current_unix_timestamp() > stale_deadline:
+            raise UserError("The evidence replacement window has closed")
+        a.claim_evidence_urls = _require_http_urls(claim_evidence_urls, 1, "Claim evidence URL")
+        a.reference_urls = _require_http_urls(reference_urls, 2, "Reference URL")
+        self.agreements[agreement_id] = a
+
+    @gl.public.write
+    def settle_inconclusive(self, agreement_id: str) -> None:
+        """Permissionless. A filed claim that never resolves by the stale deadline pays the provider."""
+        if agreement_id not in self.agreements:
+            raise UserError("Agreement does not exist")
+        a = self.agreements[agreement_id]
+        if a.status != "CLAIM_FILED":
+            raise UserError("Cannot settle in status: " + a.status)
+        _claim_deadline, stale_deadline = self._deadlines(a)
+        if _current_unix_timestamp() <= stale_deadline:
+            raise UserError("The unresolved claim has not timed out yet")
+        self._settle(agreement_id, "PROVIDER_FULL", "SETTLED_INCONCLUSIVE")
+
+    def _owed_amounts(self, a: Agreement):
+        fee = a.fee_amount
+        refund = a.breach_refund_amount
+        kind = a.settlement_kind
+        if kind == "PROVIDER_FULL":
+            return fee, bigint(0)
+        if kind == "SPLIT_BREACH":
+            return fee - refund, refund
+        if kind == "CUSTOMER_FULL":
+            return bigint(0), fee
+        raise UserError("Unknown settlement kind")
+
+    def _balance_of(self, addr) -> bigint:
+        try:
+            raw = gl.get_contract_at(addr).balance
+            return bigint(int(raw))
+        except Exception:
+            return bigint(-1)
+
+    def _clear_inflight(self) -> None:
+        self.inflight_agreement_id = ""
+        self.inflight_side = ""
+        self.inflight_amount = bigint(0)
+        self.inflight_balance_before = bigint(0)
+
+    def _confirm_inflight(self, agreement_id: str, a: Agreement) -> Agreement:
+        """Mark a side paid only when the recipient balance shows the emitted value arrived."""
+        if self.inflight_agreement_id != agreement_id:
+            return a
+        side = self.inflight_side
+        target = a.provider if side == "provider" else a.customer
+        current = self._balance_of(target)
+        needed = self.inflight_balance_before + self.inflight_amount
+        if current < bigint(0) or current < needed:
+            return a
+        if side == "provider":
+            a.provider_paid = True
+            a.provider_in_flight = False
+        elif side == "customer":
+            a.customer_refunded = True
+            a.customer_in_flight = False
+        else:
+            return a
+        self._clear_inflight()
+        return a
+
+    def _emit_side(self, agreement_id: str, a: Agreement, side: str, target, amount: bigint) -> Agreement:
+        before = self._balance_of(target)
+        if before < bigint(0):
+            a.status = "PAYOUT_FAILED"
+            a.settled = False
+            a.verdict_reason = str(a.verdict_reason) + " (Could not read balance before " + side + " transfer)"
+            return a
+        try:
+            gl.get_contract_at(target).emit_transfer(value=u256(amount), on="finalized")
+        except Exception as e:
+            a.status = "PAYOUT_FAILED"
+            a.settled = False
+            a.verdict_reason = str(a.verdict_reason) + " (" + side + " payout failed: " + str(e) + ")"
+            return a
+        if side == "provider":
+            a.provider_in_flight = True
+        else:
+            a.customer_in_flight = True
+        self.inflight_agreement_id = agreement_id
+        self.inflight_side = side
+        self.inflight_amount = amount
+        self.inflight_balance_before = before
+        a.status = "PAYOUT_PENDING"
+        a.settled = False
+        return a
+
     def _settle(self, agreement_id: str, kind: str, success_status: str) -> None:
         """Persist the payout kind before any transfer so retry does not re-derive it."""
         a = self.agreements[agreement_id]
@@ -458,55 +596,82 @@ class Contract(gl.Contract):
         self._execute_settlement(agreement_id)
 
     def _execute_settlement(self, agreement_id: str) -> None:
+        """Emit at most one transfer. A side is paid only after reconcile sees the balance."""
         a = self.agreements[agreement_id]
         if a.settled:
             return
 
-        fee = a.fee_amount
-        refund = a.breach_refund_amount
-        kind = a.settlement_kind
+        provider_amount, customer_amount = self._owed_amounts(a)
+        a.provider_credit = provider_amount
+        a.customer_credit = customer_amount
+        a = self._confirm_inflight(agreement_id, a)
 
-        if kind == "PROVIDER_FULL":
-            provider_amount, customer_amount = fee, bigint(0)
-        elif kind == "SPLIT_BREACH":
-            provider_amount, customer_amount = fee - refund, refund
-        elif kind == "CUSTOMER_FULL":
-            provider_amount, customer_amount = bigint(0), fee
-        else:
-            raise UserError("Unknown settlement kind")
-
-        any_failure = False
+        if self.inflight_agreement_id:
+            a.status = "PAYOUT_PENDING"
+            a.settled = False
+            self.agreements[agreement_id] = a
+            return
 
         if provider_amount > bigint(0) and not a.provider_paid:
-            try:
-                gl.get_contract_at(a.provider).emit_transfer(value=u256(provider_amount))
-                a.provider_paid = True
-            except Exception as e:
-                any_failure = True
-                a.verdict_reason = str(a.verdict_reason) + " (Provider payout failed: " + str(e) + ")"
+            a = self._emit_side(agreement_id, a, "provider", a.provider, provider_amount)
+            self.agreements[agreement_id] = a
+            return
 
         if customer_amount > bigint(0) and not a.customer_refunded:
-            try:
-                gl.get_contract_at(a.customer).emit_transfer(value=u256(customer_amount))
-                a.customer_refunded = True
-            except Exception as e:
-                any_failure = True
-                a.verdict_reason = str(a.verdict_reason) + " (Customer refund failed: " + str(e) + ")"
+            a = self._emit_side(agreement_id, a, "customer", a.customer, customer_amount)
+            self.agreements[agreement_id] = a
+            return
 
-        if any_failure:
-            a.status = "PAYOUT_FAILED"
-        else:
-            a.settled = True
-            a.status = a.settlement_success_status
+        a.settled = True
+        a.status = a.settlement_success_status
         self.agreements[agreement_id] = a
 
+    @gl.public.write.payable
+    def __on_errored_message__(self):
+        """Downstream delivery failed. Keep the credit and allow one fresh emission."""
+        refunded = bigint(gl.message.value)
+        agreement_id = self.inflight_agreement_id
+        if not agreement_id or agreement_id not in self.agreements:
+            return
+        if refunded != self.inflight_amount:
+            return
+        a = self.agreements[agreement_id]
+        side = self.inflight_side
+        if side == "provider":
+            a.provider_in_flight = False
+            a.provider_paid = False
+        elif side == "customer":
+            a.customer_in_flight = False
+            a.customer_refunded = False
+        else:
+            return
+        a.status = "PAYOUT_FAILED"
+        a.settled = False
+        note = " (Delivery failed for " + side + "; credit preserved)"
+        if note not in str(a.verdict_reason):
+            a.verdict_reason = str(a.verdict_reason) + note
+        self.agreements[agreement_id] = a
+        self._clear_inflight()
+
     @gl.public.write
-    def retry_resolution(self, agreement_id: str) -> None:
-        """Permissionless. Pays only the side still unpaid. Does not re-run the AI."""
+    def reconcile_payout(self, agreement_id: str) -> None:
+        """Permissionless. Confirms delivered transfers, then emits the next unpaid side."""
         if agreement_id not in self.agreements:
             raise UserError("Agreement does not exist")
         a = self.agreements[agreement_id]
-        if a.status != "PAYOUT_FAILED":
+        if a.settled:
+            raise UserError("Agreement is already settled")
+        if a.status not in ("PAYOUT_PENDING", "PAYOUT_FAILED"):
+            raise UserError("Cannot reconcile in status: " + a.status)
+        self._execute_settlement(agreement_id)
+
+    @gl.public.write
+    def retry_resolution(self, agreement_id: str) -> None:
+        """Permissionless. Re-emits only a side whose delivery failed. Does not re-run the AI."""
+        if agreement_id not in self.agreements:
+            raise UserError("Agreement does not exist")
+        a = self.agreements[agreement_id]
+        if a.status not in ("PAYOUT_FAILED", "PAYOUT_PENDING"):
             raise UserError("Can only retry PAYOUT_FAILED agreements")
         self._execute_settlement(agreement_id)
 
@@ -534,6 +699,11 @@ class Contract(gl.Contract):
             "provider_paid": a.provider_paid,
             "customer_refunded": a.customer_refunded,
             "settled": a.settled,
+            "decisive_facts": a.decisive_facts,
+            "provider_credit": str(a.provider_credit),
+            "customer_credit": str(a.customer_credit),
+            "provider_in_flight": a.provider_in_flight,
+            "customer_in_flight": a.customer_in_flight,
         }
 
     @gl.public.view

@@ -8,6 +8,7 @@ from transfer_mock import (
     amounts_to,
     clear_transfer_failures,
     fail_transfers_to,
+    hold_delivery_to,
     reset_transfer_log,
     transfer_log,
 )
@@ -182,8 +183,25 @@ def _install_mocks(vm, llm, web=None):
         vm.mock_llm(".*", payload_llm)
 
 
-def _verdict(name, confidence, reason):
-    return {"verdict": name, "confidence": confidence, "reason": reason}
+def _verdict(name, confidence, reason, facts="downtime recorded in the cited sources"):
+    return {
+        "verdict": name,
+        "confidence": confidence,
+        "reason": reason,
+        "decisive_facts": facts,
+    }
+
+
+def _confirm_payout(contract, agreement_id):
+    """Drive emission through balance confirmation. One call emits or confirms one side."""
+    for _ in range(6):
+        row = _get(contract, agreement_id)
+        if row.get("settled"):
+            return row
+        if row["status"] not in ("PAYOUT_PENDING", "PAYOUT_FAILED"):
+            return row
+        contract.reconcile_payout(agreement_id)
+    return _get(contract, agreement_id)
 
 
 def _resolve(contract, vm, caller, agreement_id, name, confidence, reason, web=None):
@@ -221,8 +239,9 @@ def test_sla_met_pays_provider_full_fee(direct_vm, direct_deploy, direct_account
     _after_period(contract, vm, monkeypatch, agreement_id)
     _file(contract, vm, customer, agreement_id)
     _resolve(contract, vm, stranger, agreement_id, "SLA_MET", 91, "Sources show 20 minutes, under 60")
-
-    row = _get(contract, agreement_id)
+    assert _get(contract, agreement_id)["status"] == "PAYOUT_PENDING"
+    assert _get(contract, agreement_id)["provider_paid"] is False
+    row = _confirm_payout(contract, agreement_id)
     assert row["status"] == "RESOLVED_SLA_MET"
     assert row["verdict"] == "SLA_MET"
     assert int(row["confidence"]) == 91
@@ -234,6 +253,7 @@ def test_sla_met_pays_provider_full_fee(direct_vm, direct_deploy, direct_account
     assert amounts_to(row["customer"]) == []
     assert vm.run_validator() is True
     assert vm.run_validator(leader_result=_verdict("SLA_BREACHED", 91, "no")) is False
+    assert vm.run_validator(leader_result=_verdict("SLA_MET", 91, "no", facts="a different outage")) is False
 
 
 def test_sla_breached_splits_exact_amounts(direct_vm, direct_deploy, direct_accounts, monkeypatch):
@@ -244,8 +264,7 @@ def test_sla_breached_splits_exact_amounts(direct_vm, direct_deploy, direct_acco
     _after_period(contract, vm, monkeypatch, agreement_id)
     _file(contract, vm, customer, agreement_id)
     _resolve(contract, vm, customer, agreement_id, "SLA_BREACHED", 88, "150 minutes exceeds 60")
-
-    row = _get(contract, agreement_id)
+    row = _confirm_payout(contract, agreement_id)
     assert row["status"] == "RESOLVED_SLA_BREACHED"
     assert row["settlement_kind"] == "SPLIT_BREACH"
     assert row["settled"] is True
@@ -262,7 +281,7 @@ def test_cancel_unaccepted_refunds_customer(direct_vm, direct_deploy, direct_acc
     assert _get(contract, agreement_id)["status"] == "PENDING_ACCEPTANCE"
     with _as(vm, customer):
         contract.cancel_unaccepted(agreement_id)
-    row = _get(contract, agreement_id)
+    row = _confirm_payout(contract, agreement_id)
     assert row["status"] == "CANCELLED_REFUNDED"
     assert row["settlement_kind"] == "CUSTOMER_FULL"
     assert row["settled"] is True
@@ -334,7 +353,7 @@ def test_settle_unclaimed_pays_provider(direct_vm, direct_deploy, direct_account
     _past_claim(contract, vm, monkeypatch, agreement_id)
     with _as(vm, stranger):
         contract.settle_unclaimed(agreement_id)
-    row = _get(contract, agreement_id)
+    row = _confirm_payout(contract, agreement_id)
     assert row["status"] == "SETTLED_NO_CLAIM"
     assert row["settlement_kind"] == "PROVIDER_FULL"
     assert amounts_to(row["provider"]) == [FEE]
@@ -359,7 +378,7 @@ def test_low_confidence_dispute_then_refile_and_resolve(direct_vm, direct_deploy
     _file(contract, vm, customer, agreement_id, [EVIDENCE], [REF_STATUS, REF_MONITOR])
     assert _get(contract, agreement_id)["status"] == "CLAIM_FILED"
     _resolve(contract, vm, customer, agreement_id, "SLA_BREACHED", 84, "archive shows 150 minutes")
-    row = _get(contract, agreement_id)
+    row = _confirm_payout(contract, agreement_id)
     assert row["status"] == "RESOLVED_SLA_BREACHED"
     assert amounts_to(row["customer"]) == [REFUND]
     assert amounts_to(row["provider"]) == [FEE - REFUND]
@@ -382,7 +401,7 @@ def test_stale_dispute_pays_provider(direct_vm, direct_deploy, direct_accounts, 
         _file(contract, vm, customer, agreement_id)
     with _as(vm, stranger):
         contract.settle_stale_dispute(agreement_id)
-    row = _get(contract, agreement_id)
+    row = _confirm_payout(contract, agreement_id)
     assert row["status"] == "SETTLED_STALE_DISPUTE"
     assert amounts_to(row["provider"]) == [FEE]
     assert amounts_to(row["customer"]) == []
@@ -423,13 +442,14 @@ def test_bad_json_and_disallowed_verdict_revert(direct_vm, direct_deploy, direct
         with _as(vm, customer):
             contract.resolve_claim(agreement_id)
 
-    fenced = '```json\n{"verdict":"SLA_MET","confidence":77,"reason":"under the cap"}\n```'
+    fenced = '```json\n{"verdict":"SLA_MET","confidence":77,"decisive_facts":"downtime=20m","reason":"under the cap"}\n```'
     _install_mocks(vm, fenced)
     with _as(vm, provider):
         contract.resolve_claim(agreement_id)
-    row = _get(contract, agreement_id)
+    row = _confirm_payout(contract, agreement_id)
     assert row["verdict"] == "SLA_MET"
     assert int(row["confidence"]) == 77
+    assert row["decisive_facts"] == "downtime=20m"
     assert row["status"] == "RESOLVED_SLA_MET"
 
 
@@ -583,15 +603,15 @@ def test_split_provider_fail_then_retry_does_not_double_pay(direct_vm, direct_de
     row = _get(contract, agreement_id)
     assert row["status"] == "PAYOUT_FAILED"
     assert row["settlement_kind"] == "SPLIT_BREACH"
+    assert row["provider_credit"] == str(FEE - REFUND)
+    assert row["customer_credit"] == str(REFUND)
     assert row["provider_paid"] is False
-    assert row["customer_refunded"] is True
+    assert row["customer_refunded"] is False
     assert amounts_to(row["provider"]) == []
-    assert amounts_to(row["customer"]) == [REFUND]
+    assert amounts_to(row["customer"]) == []
 
     clear_transfer_failures()
-    with _as(vm, stranger):
-        contract.retry_resolution(agreement_id)
-    row = _get(contract, agreement_id)
+    row = _confirm_payout(contract, agreement_id)
     assert row["status"] == "RESOLVED_SLA_BREACHED"
     assert row["settled"] is True
     assert amounts_to(row["provider"]) == [FEE - REFUND]
@@ -605,18 +625,19 @@ def test_split_customer_fail_then_retry_does_not_double_pay(direct_vm, direct_de
     contract = direct_deploy(CONTRACT_PATH)
     vm = _active_vm(direct_vm)
     agreement_id = _split_ready(contract, vm, monkeypatch, customer, provider)
-    fail_transfers_to([customer])
     _resolve(contract, vm, provider, agreement_id, "SLA_BREACHED", 86, "150 minutes")
+    fail_transfers_to([customer])
+    contract.reconcile_payout(agreement_id)
     row = _get(contract, agreement_id)
     assert row["status"] == "PAYOUT_FAILED"
     assert row["provider_paid"] is True
     assert row["customer_refunded"] is False
+    assert row["customer_credit"] == str(REFUND)
     assert amounts_to(row["provider"]) == [FEE - REFUND]
     assert amounts_to(row["customer"]) == []
 
     clear_transfer_failures()
-    contract.retry_resolution(agreement_id)
-    row = _get(contract, agreement_id)
+    row = _confirm_payout(contract, agreement_id)
     assert row["status"] == "RESOLVED_SLA_BREACHED"
     assert amounts_to(row["provider"]) == [FEE - REFUND]
     assert amounts_to(row["customer"]) == [REFUND]
@@ -637,8 +658,7 @@ def test_split_both_fail_then_retry_pays_each_once(direct_vm, direct_deploy, dir
 
     clear_transfer_failures()
     reset_transfer_log()
-    contract.retry_resolution(agreement_id)
-    row = _get(contract, agreement_id)
+    row = _confirm_payout(contract, agreement_id)
     assert row["settled"] is True
     assert amounts_to(row["provider"]) == [FEE - REFUND]
     assert amounts_to(row["customer"]) == [REFUND]
@@ -660,8 +680,7 @@ def test_provider_full_fail_then_retry(direct_vm, direct_deploy, direct_accounts
     assert transfer_log() == []
 
     clear_transfer_failures()
-    contract.retry_resolution(agreement_id)
-    row = _get(contract, agreement_id)
+    row = _confirm_payout(contract, agreement_id)
     assert row["status"] == "SETTLED_NO_CLAIM"
     assert amounts_to(row["provider"]) == [FEE]
     assert amounts_to(row["customer"]) == []
@@ -682,11 +701,89 @@ def test_customer_full_fail_then_retry(direct_vm, direct_deploy, direct_accounts
     assert transfer_log() == []
 
     clear_transfer_failures()
-    contract.retry_resolution(agreement_id)
-    row = _get(contract, agreement_id)
+    row = _confirm_payout(contract, agreement_id)
     assert row["status"] == "CANCELLED_REFUNDED"
     assert amounts_to(row["customer"]) == [FEE]
     assert amounts_to(row["provider"]) == []
+
+
+def test_replace_evidence_and_inconclusive_timeout(direct_vm, direct_deploy, direct_accounts, monkeypatch):
+    customer, provider, stranger = direct_accounts[1], direct_accounts[2], direct_accounts[3]
+    contract = direct_deploy(CONTRACT_PATH)
+    vm = _active_vm(direct_vm)
+    agreement_id = _ready(contract, vm, monkeypatch, customer, provider)
+    _after_period(contract, vm, monkeypatch, agreement_id)
+    _file(contract, vm, customer, agreement_id)
+    broken = dict(_web())
+    del broken[re.escape(REF_MONITOR)]
+    with vm.expect_revert("Failed to fetch"):
+        _resolve(contract, vm, customer, agreement_id, "SLA_BREACHED", 90, "unread", broken)
+    assert _get(contract, agreement_id)["status"] == "CLAIM_FILED"
+
+    replaced = "https://monitor.example/archive/replaced"
+    with vm.expect_revert("Only the customer"):
+        with _as(vm, stranger):
+            contract.replace_claim_evidence(agreement_id, [EVIDENCE], [REF_STATUS, replaced])
+    with _as(vm, customer):
+        contract.replace_claim_evidence(agreement_id, [EVIDENCE], [REF_STATUS, replaced])
+    assert replaced in _get(contract, agreement_id)["reference_urls"]
+
+    row = _get(contract, agreement_id)
+    _warp(vm, monkeypatch, int(row["stale_deadline"]))
+    with vm.expect_revert("has not timed out"):
+        contract.settle_inconclusive(agreement_id)
+    _warp(vm, monkeypatch, int(row["stale_deadline"]) + 1)
+    with vm.expect_revert("timed out"):
+        _resolve(contract, vm, customer, agreement_id, "SLA_BREACHED", 99, "too late")
+    with vm.expect_revert("replacement window"):
+        with _as(vm, customer):
+            contract.replace_claim_evidence(agreement_id, [EVIDENCE], [REF_STATUS, replaced])
+    with _as(vm, stranger):
+        contract.settle_inconclusive(agreement_id)
+    row = _confirm_payout(contract, agreement_id)
+    assert row["status"] == "SETTLED_INCONCLUSIVE"
+    assert row["settlement_kind"] == "PROVIDER_FULL"
+    assert row["provider_paid"] is True
+    assert amounts_to(row["provider"]) == [FEE]
+    assert amounts_to(row["customer"]) == []
+
+
+def test_failed_delivery_preserves_credit_and_does_not_double_pay(direct_vm, direct_deploy, direct_accounts, monkeypatch):
+    customer, provider = direct_accounts[1], direct_accounts[2]
+    contract = direct_deploy(CONTRACT_PATH)
+    vm = _active_vm(direct_vm)
+    agreement_id = _ready(contract, vm, monkeypatch, customer, provider)
+    _past_claim(contract, vm, monkeypatch, agreement_id)
+    hold_delivery_to([provider])
+    contract.settle_unclaimed(agreement_id)
+    row = _get(contract, agreement_id)
+    assert row["status"] == "PAYOUT_PENDING"
+    assert row["provider_paid"] is False
+    assert row["provider_in_flight"] is True
+    assert row["provider_credit"] == str(FEE)
+    assert amounts_to(row["provider"]) == [FEE]
+
+    contract.reconcile_payout(agreement_id)
+    row = _get(contract, agreement_id)
+    assert row["provider_paid"] is False
+    assert amounts_to(row["provider"]) == [FEE]
+
+    _set_value(vm, FEE)
+    contract.__on_errored_message__()
+    row = _get(contract, agreement_id)
+    assert row["status"] == "PAYOUT_FAILED"
+    assert row["provider_paid"] is False
+    assert row["provider_in_flight"] is False
+    assert row["provider_credit"] == str(FEE)
+    assert "credit preserved" in row["verdict_reason"]
+
+    clear_transfer_failures()
+    row = _confirm_payout(contract, agreement_id)
+    assert row["status"] == "SETTLED_NO_CLAIM"
+    assert row["provider_paid"] is True
+    assert amounts_to(row["provider"]) == [FEE, FEE]
+    with vm.expect_revert("already settled"):
+        contract.reconcile_payout(agreement_id)
 
 
 def test_disallowed_verdict_value_reverts(direct_vm, direct_deploy, direct_accounts, monkeypatch):

@@ -14,13 +14,13 @@ https://uptimeguard-genlayer.vercel.app
 
 ## Deployed Contract
 
-Deployed on GenLayer Studionet with `Result: SUCCESS`.
+Deployed on GenLayer Studionet. This address is the contract that includes evidence replacement, the inconclusive-claim timeout, and finalized payout reconciliation.
 
-- **Address:** `0xB71F31BC1Ca3a772E7c89604871D5818bC8EbA3D`
-- **Explorer:** https://genlayer-explorer.vercel.app/address/0xB71F31BC1Ca3a772E7c89604871D5818bC8EbA3D
+- **Address:** `0x0c055f852A63D59208DDd3D82A7C677a213476f3`
+- **Explorer:** https://explorer-studio.genlayer.com/address/0x0c055f852A63D59208DDd3D82A7C677a213476f3
 
 ```env
-VITE_CONTRACT_ADDRESS=0xB71F31BC1Ca3a772E7c89604871D5818bC8EbA3D
+VITE_CONTRACT_ADDRESS=0x0c055f852A63D59208DDd3D82A7C677a213476f3
 ```
 
 If that variable is empty, the frontend still opens: a warning banner says the address is missing, the fee preview still works, signing stays locked, and the page does not go blank.
@@ -62,7 +62,7 @@ Studio header:
 
 `@gl.public.write.payable` exists in `genlayer/gl/annotations.py` for this hash. The runner rejects a non-zero value on a non-payable method (`called non-payable method ... with non-zero value`). `create_agreement` therefore uses `.payable`. The older note that the payable decorator does not exist is wrong for this SDK.
 
-`gl.vm.Return` in this SDK stores the leader result on `.calldata`. There is no `.value`. The validator compares `verdict` with `==` and requires both sides to land on the same side of `confidence >= 60`, so two validators cannot both say `SLA_MET` while one settles and the other leaves the claim `DISPUTED`.
+`gl.vm.Return` in this SDK stores the leader result on `.calldata`. There is no `.value`. The validator compares `verdict` and `decisive_facts` with `==`, and requires both sides to land on the same side of `confidence >= 60`. Two validators cannot settle on the same label while citing different source facts.
 
 `DynArray()` cannot be constructed (`this class can't be instantiated by user`). Empty URL lists are stored as `[]`; storage coerces them to `DynArray`.
 
@@ -78,16 +78,19 @@ ACTIVE
   └─ after claim_deadline: settle_unclaimed → PROVIDER_FULL → SETTLED_NO_CLAIM
 
 CLAIM_FILED
-  └─ resolve_claim
-       ├─ confidence < 60 → DISPUTED
-       ├─ SLA_MET → PROVIDER_FULL → RESOLVED_SLA_MET
-       └─ SLA_BREACHED → SPLIT_BREACH → RESOLVED_SLA_BREACHED
+  ├─ replace_claim_evidence until stale_deadline
+  ├─ resolve_claim until stale_deadline
+  │    ├─ confidence < 60 → DISPUTED
+  │    ├─ SLA_MET → PROVIDER_FULL → RESOLVED_SLA_MET
+  │    └─ SLA_BREACHED → SPLIT_BREACH → RESOLVED_SLA_BREACHED
+  └─ after stale_deadline: settle_inconclusive → PROVIDER_FULL → SETTLED_INCONCLUSIVE
 
 DISPUTED
   ├─ file_claim again before stale_deadline → CLAIM_FILED
   └─ after stale_deadline: settle_stale_dispute → PROVIDER_FULL → SETTLED_STALE_DISPUTE
 
-PAYOUT_FAILED → retry_resolution (does not re-run the AI; pays only the missing side)
+PAYOUT_PENDING → reconcile_payout (confirms delivery, then emits the next side)
+PAYOUT_FAILED → retry_resolution (does not re-run the AI; emits only a side whose delivery failed)
 ```
 
 Deadlines:
@@ -97,8 +100,9 @@ Deadlines:
 - The claim window is the closed interval `[period_end, claim_deadline]`
 - `settle_unclaimed` only when `now > claim_deadline`
 - `settle_stale_dispute` only when `now > stale_deadline`
+- `settle_inconclusive` only when the status is `CLAIM_FILED` and `now > stale_deadline`
 
-Every transfer goes through `_settle(kind, success_status)`. The payout kind is stored **before** the transfer: `PROVIDER_FULL`, `SPLIT_BREACH`, or `CUSTOMER_FULL`. The flags `provider_paid` and `customer_refunded` keep `retry_resolution` from paying the same side twice.
+Every transfer goes through `_settle(kind, success_status)`. The payout kind and the exact credit for each side are stored **before** any transfer: `PROVIDER_FULL`, `SPLIT_BREACH`, or `CUSTOMER_FULL`. `emit_transfer` only posts the message (`on="finalized"`). `provider_paid` / `customer_refunded` become true later, in `reconcile_payout`, after the recipient balance has increased by that credit. If delivery fails, `__on_errored_message__` clears the in-flight flag and leaves the credit in place, so retry emits that side once.
 
 On `SLA_BREACHED`, the provider receives `fee - breach_refund_amount` and the customer receives exactly `breach_refund_amount`.
 
@@ -137,7 +141,7 @@ Every amount is an integer number of wei (`1 GEN = 10^18`). There is no `float`,
 | 3 | Provider receives the full fee | `_execute_settlement` `PROVIDER_FULL` | READ `fee_amount` | `emit_transfer(value=u256(fee))` | wei |
 | 4 | Split when the SLA is breached | `_execute_settlement` `SPLIT_BREACH` | READ both | provider `fee - refund`, customer `refund` | wei |
 | 5 | Customer receives the full fee | `_execute_settlement` `CUSTOMER_FULL` | READ `fee_amount` | `emit_transfer` to the customer | wei |
-| 6 | Retry the missing side | `retry_resolution` | READ `provider_paid` / `customer_refunded` and the stored `settlement_kind` | does not recompute and does not re-run the AI | wei |
+| 6 | Retry or reconcile | `retry_resolution` / `reconcile_payout` | READ stored credits, in-flight flags, and recipient balance | a side is paid only after the balance shows the emitted value; a failed delivery keeps the credit | wei |
 | 7 | GEN input | `frontend/src/money.js` `sanitizeGenInput` | WRITE the input string | digits and one `.`, at most 18 fractional digits | GEN string |
 | 8 | GEN → wei before signing | `parseGenToWei` | WRITE the transaction `value` and `breach_refund_amount` | integer part plus 18 fractional digits as `BigInt` | wei |
 | 9 | 25% / 50% / 75% chips | `percentOfWei` | WRITE the suggested refund | `fee * pct / 100n`, integer division | wei |

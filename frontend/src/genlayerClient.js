@@ -229,7 +229,13 @@ export const sendContractTransaction = async ({ from, to = CONTRACT_ADDRESS, fun
   }
 };
 
-export const waitForFinalizedTx = async (txHash, maxRetries = 24, intervalMs = 2000) => {
+const executionFailed = (receipt) => {
+  const execName = receipt?.txExecutionResultName || receipt?.executionResult || receipt?.txExecutionResult;
+  const execStr = String(execName || '').toUpperCase();
+  return execName === ExecutionResult.FINISHED_WITH_ERROR || execStr.includes('FINISHED_WITH_ERROR');
+};
+
+export const waitForFinalizedTx = async (txHash, maxRetries = 40, intervalMs = 3000) => {
   if (!txHash) throw new Error('Missing transaction hash.');
   let evmReceipt = null;
   try {
@@ -239,28 +245,35 @@ export const waitForFinalizedTx = async (txHash, maxRetries = 24, intervalMs = 2
     if (studioMsg.includes('revert')) throw studioErr;
   }
   const client = getGenlayerClient();
-  if (client && client.waitForTransactionReceipt) {
-    try {
-      const receipt = await client.waitForTransactionReceipt({
-        hash: txHash,
-        status: TransactionStatus.ACCEPTED,
-        retries: Math.min(maxRetries, 16),
-        interval: intervalMs
-      });
-      const execName = receipt?.txExecutionResultName || receipt?.executionResult || receipt?.txExecutionResult;
-      const execStr = String(execName || '').toUpperCase();
-      if (execName === ExecutionResult.FINISHED_WITH_ERROR || execStr.includes('FINISHED_WITH_ERROR')) {
-        const detail = receipt?.txExecutionError || receipt?.stderr || '';
-        throw new Error('The contract finished with an error (not ACCEPTED). State is unchanged. ' + String(detail));
-      }
-      return receipt;
-    } catch (err) {
-      const msg = String(err?.message || '');
-      if (msg.includes('not ACCEPTED') || msg.includes('finished with an error')) throw err;
-    }
+  if (!client || !client.waitForTransactionReceipt) {
+    throw new Error('GenLayer receipt client is not ready. Acceptance is not confirmation.');
   }
-  if (evmReceipt) return evmReceipt;
-  throw new Error('Timed out waiting for ACCEPTED on GenLayer.');
+  const accepted = await client.waitForTransactionReceipt({
+    hash: txHash,
+    status: TransactionStatus.ACCEPTED,
+    retries: Math.min(maxRetries, 20),
+    interval: intervalMs
+  });
+  if (executionFailed(accepted)) {
+    const detail = accepted?.txExecutionError || accepted?.stderr || '';
+    throw new Error('The contract finished with an error. State is unchanged. ' + String(detail));
+  }
+  let finalized;
+  try {
+    finalized = await client.waitForTransactionReceipt({
+      hash: txHash,
+      status: TransactionStatus.FINALIZED,
+      retries: maxRetries,
+      interval: intervalMs
+    });
+  } catch (err) {
+    throw new Error('Consensus accepted the transaction, but it is not finalized yet. ' + String(err?.message || err));
+  }
+  if (executionFailed(finalized)) {
+    const detail = finalized?.txExecutionError || finalized?.stderr || '';
+    throw new Error('The finalized transaction failed. State is unchanged. ' + String(detail));
+  }
+  return { phase: 'finalized', accepted, finalized, evmReceipt };
 };
 
 export const readContractState = async (functionName, args = [], targetAddress = CONTRACT_ADDRESS) => {

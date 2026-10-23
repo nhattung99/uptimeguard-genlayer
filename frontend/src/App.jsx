@@ -56,6 +56,19 @@ const WINDOWS = [
   { days: '14', label: '14 days' }
 ];
 
+const CONFIRMED_STATUSES = {
+  accept_agreement: ['ACTIVE'],
+  cancel_unaccepted: ['PAYOUT_PENDING', 'PAYOUT_FAILED', 'CANCELLED_REFUNDED'],
+  file_claim: ['CLAIM_FILED'],
+  replace_claim_evidence: ['CLAIM_FILED'],
+  resolve_claim: ['DISPUTED', 'PAYOUT_PENDING', 'PAYOUT_FAILED', 'RESOLVED_SLA_MET', 'RESOLVED_SLA_BREACHED'],
+  settle_unclaimed: ['PAYOUT_PENDING', 'PAYOUT_FAILED', 'SETTLED_NO_CLAIM'],
+  settle_stale_dispute: ['PAYOUT_PENDING', 'PAYOUT_FAILED', 'SETTLED_STALE_DISPUTE'],
+  settle_inconclusive: ['PAYOUT_PENDING', 'PAYOUT_FAILED', 'SETTLED_INCONCLUSIVE'],
+  reconcile_payout: ['PAYOUT_PENDING', 'PAYOUT_FAILED', 'RESOLVED_SLA_MET', 'RESOLVED_SLA_BREACHED', 'SETTLED_NO_CLAIM', 'SETTLED_STALE_DISPUTE', 'SETTLED_INCONCLUSIVE', 'CANCELLED_REFUNDED'],
+  retry_resolution: ['PAYOUT_PENDING', 'PAYOUT_FAILED', 'RESOLVED_SLA_MET', 'RESOLVED_SLA_BREACHED', 'SETTLED_NO_CLAIM', 'SETTLED_STALE_DISPUTE', 'SETTLED_INCONCLUSIVE', 'CANCELLED_REFUNDED']
+};
+
 const FEE_CHIPS = ['0.5', '1', '2', '5', '10'];
 const REFUND_PCTS = [25, 50, 75];
 
@@ -69,7 +82,9 @@ const STATUS_META = {
   SETTLED_NO_CLAIM: { label: 'No claim — provider paid in full', tone: 'ok' },
   SETTLED_STALE_DISPUTE: { label: 'Dispute expired — provider paid in full', tone: 'ok' },
   CANCELLED_REFUNDED: { label: 'Cancelled — customer refunded in full', tone: 'muted' },
-  PAYOUT_FAILED: { label: 'Payout incomplete', tone: 'bad' }
+  PAYOUT_FAILED: { label: 'Payout incomplete', tone: 'bad' },
+  PAYOUT_PENDING: { label: 'Payout emitted, delivery unconfirmed', tone: 'warn' },
+  SETTLED_INCONCLUSIVE: { label: 'Unresolved claim timed out — provider paid in full', tone: 'ok' }
 };
 
 const canonAddr = (a) => String(a || '').trim().toLowerCase().replace(/^0x/, '');
@@ -154,7 +169,11 @@ const normalizeAgreement = (raw, id) => {
     settlement_success_status: String(raw.settlement_success_status || ''),
     provider_paid: Boolean(raw.provider_paid),
     customer_refunded: Boolean(raw.customer_refunded),
-    settled: Boolean(raw.settled)
+    settled: Boolean(raw.settled),
+    provider_in_flight: Boolean(raw.provider_in_flight),
+    customer_in_flight: Boolean(raw.customer_in_flight),
+    provider_credit: toWeiString(raw.provider_credit),
+    customer_credit: toWeiString(raw.customer_credit)
   };
 };
 
@@ -201,15 +220,17 @@ function UrlEditor({ label, urls, onChange }) {
 
 function PayoutLines({ row }) {
   const shares = settlementShares(row.settlement_kind, row.fee_amount, row.breach_refund_amount);
-  const line = (label, owed, paid) => {
+  const line = (label, owed, paid, inFlight) => {
     if (owed === 0n) return `${label}: nothing to receive`;
     const shown = `${formatWeiToGen(owed)} GEN`;
-    return paid ? `${label}: received ${shown}` : `${label}: waiting on ${shown}`;
+    if (paid) return `${label}: received ${shown}`;
+    if (inFlight) return `${label}: emitted ${shown}, delivery not confirmed`;
+    return `${label}: waiting on ${shown}`;
   };
   return (
     <div className="preview">
-      <p>{line('Provider', shares.providerGets, row.provider_paid)}</p>
-      <p>{line('Customer', shares.customerGets, row.customer_refunded)}</p>
+      <p>{line('Provider', shares.providerGets, row.provider_paid, row.provider_in_flight)}</p>
+      <p>{line('Customer', shares.customerGets, row.customer_refunded, row.customer_in_flight)}</p>
     </div>
   );
 }
@@ -254,7 +275,7 @@ export default function App() {
   const loadAgreements = useCallback(async () => {
     if (!configured) {
       setAgreements([]);
-      return;
+      return [];
     }
     const countRaw = await readContractState('get_agreement_count', []);
     const count = toCount(countRaw);
@@ -264,7 +285,9 @@ export default function App() {
       const row = normalizeAgreement(raw, i.toString());
       if (row) rows.push(row);
     }
-    setAgreements(rows.reverse());
+    const ordered = rows.reverse();
+    setAgreements(ordered);
+    return ordered;
   }, [configured]);
 
   useEffect(() => {
@@ -300,8 +323,9 @@ export default function App() {
   };
 
   const runWrite = async (key, title, functionName, args, valueWei = 0n) => {
+    const beforeIds = new Set(agreements.map((item) => item.id));
     setBusy(key);
-    setNotice({ kind: 'ok', text: `${title}: waiting for your signature, then for GenLayer ACCEPTED…` });
+    setNotice({ kind: 'ok', text: `${title}: waiting for your signature, then for consensus acceptance…` });
     try {
       const hash = await sendContractTransaction({
         from: account,
@@ -309,9 +333,35 @@ export default function App() {
         args,
         value: valueWei
       });
+      setNotice({ kind: 'ok', text: `${title}: consensus accepted it. Waiting until the transaction is finalized…` });
       await waitForFinalizedTx(hash);
-      await loadAgreements();
-      setNotice({ kind: 'ok', text: `${title} was accepted.` });
+      const rows = await loadAgreements();
+      const targetId = functionName === 'create_agreement' ? '' : String(args[0] || '');
+      const row = targetId ? (rows || []).find((item) => item.id === targetId) : null;
+      const allowed = CONFIRMED_STATUSES[functionName];
+      const confirmed = functionName === 'create_agreement'
+        ? (rows || []).some((item) => !beforeIds.has(item.id) && item.status === 'PENDING_ACCEPTANCE')
+        : Boolean(row) && (!allowed || allowed.includes(row.status));
+      if (!confirmed) {
+        setNotice({
+          kind: 'err',
+          text: `${title} is finalized, but the contract state is ${row ? row.status : 'not the expected agreement'}. Completion is not confirmed.`
+        });
+        return;
+      }
+      if (row && row.status === 'PAYOUT_PENDING') {
+        setNotice({
+          kind: 'ok',
+          text: `${title} is finalized. The transfer was emitted, and delivery is not confirmed yet. Click Reconcile delivery.`
+        });
+        return;
+      }
+      setNotice({
+        kind: 'ok',
+        text: row
+          ? `${title} is finalized and the contract status is ${row.status}.`
+          : `${title} is finalized and the new agreement is on the contract.`
+      });
     } catch (err) {
       setNotice({ kind: 'err', text: formatWriteError(err) });
     } finally {
@@ -566,6 +616,10 @@ function AgreementCard({ row, account, nowSec, busy, locked, onWrite, onCopy }) 
       return;
     }
     setFormError('');
+    if (row.status === 'CLAIM_FILED') {
+      onWrite(key('replace'), 'Replace evidence', 'replace_claim_evidence', [row.id, evidenceUrls, referenceUrls]);
+      return;
+    }
     onWrite(key('file'), 'File claim', 'file_claim', [row.id, evidenceUrls, referenceUrls]);
   };
 
@@ -604,10 +658,15 @@ function AgreementCard({ row, account, nowSec, busy, locked, onWrite, onCopy }) 
             Cancel and refund the fee
           </button>
         )}
-        {row.status === 'CLAIM_FILED' && (
+        {row.status === 'CLAIM_FILED' && !disputeClosed && (
           <button className="btn btn-primary" disabled={locked || busy === key('resolve')} onClick={() => onWrite(key('resolve'), 'Resolve', 'resolve_claim', [row.id])}>
             {busy === key('resolve') ? <Loader2 className="spin" size={16} /> : <Activity size={16} />}
             Ask the AI to adjudicate
+          </button>
+        )}
+        {row.status === 'CLAIM_FILED' && disputeClosed && (
+          <button className="btn btn-warn" disabled={locked || busy === key('inconclusive')} onClick={() => onWrite(key('inconclusive'), 'Settle unresolved claim', 'settle_inconclusive', [row.id])}>
+            Settle unresolved claim
           </button>
         )}
         {row.status === 'ACTIVE' && claimClosed && (
@@ -620,6 +679,11 @@ function AgreementCard({ row, account, nowSec, busy, locked, onWrite, onCopy }) 
             Settle payout
           </button>
         )}
+        {row.status === 'PAYOUT_PENDING' && (
+          <button className="btn btn-primary" disabled={locked || busy === key('reconcile')} onClick={() => onWrite(key('reconcile'), 'Reconcile delivery', 'reconcile_payout', [row.id])}>
+            Reconcile delivery
+          </button>
+        )}
         {row.status === 'PAYOUT_FAILED' && (
           <button className="btn btn-primary" disabled={locked || busy === key('retry')} onClick={() => onWrite(key('retry'), 'Retry', 'retry_resolution', [row.id])}>
             Try again
@@ -630,15 +694,18 @@ function AgreementCard({ row, account, nowSec, busy, locked, onWrite, onCopy }) 
       {row.status === 'DISPUTED' && !disputeClosed && (
         <p className="hint"><Clock size={14} /> {formatDuration(staleDeadline - nowSec)} left to refile, until {formatUnix(row.stale_deadline)}.</p>
       )}
+      {row.status === 'CLAIM_FILED' && !disputeClosed && (
+        <p className="hint"><Clock size={14} /> Evidence can be replaced until {formatUnix(row.stale_deadline)}. After that, anyone can settle the unresolved claim.</p>
+      )}
 
-      {mineCustomer && ((row.status === 'ACTIVE' && inClaimWindow) || (row.status === 'DISPUTED' && !disputeClosed)) && (
+      {mineCustomer && ((row.status === 'ACTIVE' && inClaimWindow) || ((row.status === 'DISPUTED' || row.status === 'CLAIM_FILED') && !disputeClosed)) && (
         <div className="stack">
           <p className="hint">Use at least one independent monitor or a timestamped archive, not only the provider&apos;s status page. Evidence that is not clear enough is treated as the SLA being met.</p>
           <UrlEditor label="Incident evidence links (at least 1)" urls={evidence} onChange={setEvidence} />
           <UrlEditor label="Reference sources (at least 2)" urls={refs} onChange={setRefs} />
           {formError && <p className="notice notice-err">{formError}</p>}
-          <button className="btn btn-primary" disabled={locked || busy === key('file')} onClick={file}>
-            {row.status === 'DISPUTED' ? 'Refile the claim' : 'File a claim'}
+          <button className="btn btn-primary" disabled={locked || busy === key('file') || busy === key('replace')} onClick={file}>
+            {row.status === 'DISPUTED' ? 'Refile the claim' : row.status === 'CLAIM_FILED' ? 'Replace evidence links' : 'File a claim'}
           </button>
         </div>
       )}
